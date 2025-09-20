@@ -1,0 +1,93 @@
+{
+  "name": "NPL Searcher → PDF",
+  "nodes": [
+    { "id": "webhook", "name": "Webhook (POST /npl)", "type": "n8n-nodes-base.webhook", "typeVersion": 2, "position": [200, 260],
+      "parameters": { "httpMethod": "POST", "path": "npl", "responseMode": "onReceived", "options": { "responseData": "json" } } },
+
+    { "id": "normalizeInput", "name": "Fn: Normalize Input", "type": "n8n-nodes-base.function", "typeVersion": 2, "position": [420, 260],
+      "parameters": { "functionCode": "const b=$json.body||{};return [{patent_id:b.patent_id,claims_text:b.claims_text,cutoff_date:b.cutoff_date}];" } },
+
+    { "id": "fetchPatent", "name": "HTTP: Patent Metadata", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4, "position": [640, 260],
+      "parameters": {
+        "url": "={{`https://patentsview.org/api/patents/query?q={\\\"patent_number\\\":\\\"${$json.patent_id.replace(/[^A-Za-z0-9]/g,'')}\\\"}&f=[\\\"patent_title\\\",\\\"patent_abstract\\\",\\\"patent_date\\\",\\\"cpcs\\\"]`}}",
+        "options": { "allowUnauthorizedCerts": true }
+      }
+    },
+
+    { "id": "fnPatent", "name": "Fn: Normalize Patent", "type": "n8n-nodes-base.function", "typeVersion": 2, "position": [860, 260],
+      "parameters": { "functionCode": "const p=($json.patents||[])[0]||{};return [{title:p.patent_title||'',abstract:p.patent_abstract||'',cpc:(p.cpcs?.[0]?.cpc_first_subgroup_id)||'',cutoff_date:$json.cutoff_date,claims_text:$json.claims_text,patent_id:$json.patent_id}];" } },
+
+    { "id": "claimsToElements", "name": "Fn: Claims → Elements", "type": "n8n-nodes-base.function", "typeVersion": 2, "position": [1080, 260],
+      "parameters": { "functionCode": "const raw=$json.claims_text||'';const parts=raw.split(/(?:;|\\n|\\r| where(?:in)?\\b|\\(i+\\)|\\d\\.)/i).map(s=>s.trim()).filter(Boolean);return [{...$json,elements:parts.slice(0,12)}];" }
+    },
+
+    { "id": "llmQueries", "name": "OpenAI: Query Generator", "type": "n8n-nodes-base.openAi", "typeVersion": 4, "position": [1300, 260],
+      "parameters": {
+        "operation": "chat",
+        "chatOptions": { "model": "gpt-4o-mini", "systemMessage": "You generate NPL queries as structured JSON.", "messages": [
+          { "text": "Patent title: {{$json.title}}\nAbstract: {{$json.abstract}}\nCPC: {{$json.cpc}}\nElements: {{$json.elements}}\nCutoff: {{$json.cutoff_date}}\nReturn JSON with keys boolean_core[], site_scoped{pdf[], arxiv[], standards[], theses[]}, synonym_expansions{}.", "role": "user" }
+        ] }
+      },
+      "credentials": { "openAIApi": "OpenAI (yours)" }
+    },
+
+    { "id": "fnPackQueries", "name": "Fn: Pack Queries", "type": "n8n-nodes-base.function", "typeVersion": 2, "position": [1520, 260],
+      "parameters": { "functionCode": "const out=JSON.parse($json.choices?.[0]?.message?.content||'{}');const all=[...(out.boolean_core||[]),...Object.values(out.site_scoped||{}).flat()];const uniq=[...new Set(all)].slice(0,30);return uniq.map((q,i)=>({q,idx:i,cutoff_date:$json.cutoff_date,title:$json.title,abstract:$json.abstract,elements:$json.elements}));" }
+    },
+
+    { "id": "crossref", "name": "HTTP: Crossref", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4, "position": [1740, 140],
+      "parameters": { "url": "https://api.crossref.org/works", "options": { "qs": { "query": "={{$json.q}}", "filter": "={{`from-pub-date:1900-01-01,until-pub-date:${$json.cutoff_date}`}}", "rows": 20 } } } },
+
+    { "id": "openalex", "name": "HTTP: OpenAlex", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4, "position": [1740, 260],
+      "parameters": { "url": "https://api.openalex.org/works", "options": { "qs": { "search": "={{$json.q}}", "per_page": 25 } } } },
+
+    { "id": "arxiv", "name": "HTTP: arXiv", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4, "position": [1740, 380],
+      "parameters": { "url": "={{`http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent($json.q)}&max_results=25&sortBy=submittedDate&sortOrder=descending`}}" } },
+
+    { "id": "fnNormalize", "name": "Fn: Normalize Results", "type": "n8n-nodes-base.function", "typeVersion": 2, "position": [1960, 260],
+      "parameters": { "functionCode": "function cleanTitle(t){return (t||'').replace(/\\s+/g,' ').trim()} const out=[];for (const i of $items(0,0)) {const arr=i.json.message?.items||[];for (const r of arr){out.push({source:'Crossref',title:cleanTitle(r.title?.[0]),year:r.issued?.['date-parts']?.[0]?.[0],doi:r.DOI,url:r.URL,abstract:r.abstract||'',pdf_url:(r['link']?.find(l=>l['content-type']==='application/pdf')||{}).URL })}} for (const i of $items(1,0)){for (const r of (i.json.results||[])){out.push({source:'OpenAlex',title:cleanTitle(r.title),year:parseInt((r.from_publication_date||r.publication_year||'').toString().substring(0,4))||r.publication_year,doi:r.doi,url:r.id,abstract:r.abstract_inverted_index?Object.keys(r.abstract_inverted_index).join(' '):'',pdf_url:(r.open_access?.oa_url)||''})}} for (const i of $items(2,0)){const xml=i.json; const txt=(typeof xml==='string')?xml:JSON.stringify(xml); const entries=[...txt.matchAll(/<entry>([\\s\\S]*?)<\\/entry>/g)].map(m=>m[1]); for (const e of entries){const title=(e.match(/<title>([\\s\\S]*?)<\\/title>/)||[])[1]; const abs=(e.match(/<summary>([\\s\\S]*?)<\\/summary>/)||[])[1]; const link=(e.match(/<id>([\\s\\S]*?)<\\/id>/)||[])[1]; const y=(e.match(/<published>(\\d{4})/)||[])[1]; out.push({source:'arXiv',title:cleanTitle(title),year:parseInt(y),doi:'',url:link,abstract:abs?.replace(/\\s+/g,' ').trim()||'',pdf_url:link?.replace('/abs/','/pdf/')})}} return out.map(o=>({ ...o, cutoff_date:$items(3,0)[0].json.cutoff_date, elements:$items(3,0)[0].json.elements }));" }
+    },
+
+    { "id": "fnCutoffDedupScore", "name": "Fn: Filter + Dedup + Score", "type": "n8n-nodes-base.function", "typeVersion": 2, "position": [2180, 260],
+      "parameters": { "functionCode": "const cutoff=new Date($json.cutoff_date||'2100-01-01'); const seen=new Set(); function key(r){return r.doi || (r.url||'').replace(/\\?.*/,'') || (r.title||'').toLowerCase().replace(/[^a-z0-9]+/g,'');} function score(r,els){const txt=((r.title||'')+' '+(r.abstract||'')).toLowerCase(); let s=0; for(const el of els){const toks=el.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean); const hit=toks.reduce((a,t)=>a+(txt.includes(t)?1:0),0); s+=Math.min(1,hit/3);} if(r.pdf_url) s+=0.2; if(['ieee','acm','springer','elsevier'].some(v=>(r.url||'').includes(v))) s+=0.1; return Math.min(1.5,s);} const pass=[]; for(const it of $items()){const r=it.json; const yr=(r.year||0); if (r.year && new Date(`${yr}-12-31`)>cutoff) continue; const k=key(r); if(seen.has(k)) continue; seen.add(k); r.score=score(r,r.elements||[]); if(r.score>=0.35) pass.push(r);} pass.sort((a,b)=>b.score-a.score); return pass.slice(0,60);" }
+    },
+
+    { "id": "fnHTML", "name": "Fn: Build HTML", "type": "n8n-nodes-base.function", "typeVersion": 2, "position": [2400, 260],
+      "parameters": { "functionCode": "const items=$items().map(i=>i.json); const head=`<html><head><meta charset='utf-8'><style>body{font-family:Inter,Arial,sans-serif;padding:24px;color:#111} h1{margin:0 0 8px} .meta{color:#555;margin-bottom:16px} .card{border:1px solid #eee;border-radius:12px;padding:12px;margin:10px 0} .title{font-weight:600} .src{font-size:12px;color:#666} .score{float:right;font-weight:600} a{color:#0b57d0;text-decoration:none} .small{font-size:12px;color:#666}</style></head><body>`; const meta=`<h1>NPL Search Report</h1><div class='meta'>Patent: ${$json.patent_id||''}<br>Cutoff: ${$json.cutoff_date||''}</div>`; const cards=items.map((r,i)=>`<div class='card'><div class='title'>${i+1}. ${r.title||'(untitled)'} <span class='score'>score ${r.score.toFixed(2)}</span></div><div class='src'>${r.source||''} • ${r.year||''}</div><div>${r.abstract?r.abstract.slice(0,600):''}${(r.abstract||'').length>600?'…':''}</div><div class='small'>${r.doi?`DOI: ${r.doi} • `:''}<a href='${r.url||'#'}'>link</a>${r.pdf_url?` • <a href='${r.pdf_url}'>pdf</a>`:''}</div></div>`).join(''); const foot=`</body></html>`; return [{ html: head+meta+cards+foot }];" }
+    },
+
+    { "id": "pdf", "name": "HTML → PDF (HTTP)", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4, "position": [2620, 260],
+      "parameters": {
+        "url": "http://your-wkhtmltopdf-or-gotenberg/convert/html",
+        "method": "POST",
+        "options": { "bodyContentType": "raw", "body": "={{$json.html}}", "responseFormat": "file" }
+      }
+    },
+
+    { "id": "respond", "name": "Webhook Response", "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1, "position": [2840, 260],
+      "parameters": { "responseBody": "={{ { status: 'ok', filename: 'npl-report.pdf' } }}", "responseBinaryPropertyName": "data" }
+    }
+  ],
+  "connections": {
+    "Webhook (POST /npl)": { "main": [[{ "node": "Fn: Normalize Input", "type": "main", "index": 0 }]] },
+    "Fn: Normalize Input": { "main": [[{ "node": "HTTP: Patent Metadata", "type": "main", "index": 0 }]] },
+    "HTTP: Patent Metadata": { "main": [[{ "node": "Fn: Normalize Patent", "type": "main", "index": 0 }]] },
+    "Fn: Normalize Patent": { "main": [[{ "node": "Fn: Claims → Elements", "type": "main", "index": 0 }]] },
+    "Fn: Claims → Elements": { "main": [[{ "node": "OpenAI: Query Generator", "type": "main", "index": 0 }]] },
+    "OpenAI: Query Generator": { "main": [[{ "node": "Fn: Pack Queries", "type": "main", "index": 0 }]] },
+    "Fn: Pack Queries": {
+      "main": [
+        [{ "node": "HTTP: Crossref", "type": "main", "index": 0 }],
+        [{ "node": "HTTP: OpenAlex", "type": "main", "index": 0 }],
+        [{ "node": "HTTP: arXiv", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: Crossref": { "main": [[{ "node": "Fn: Normalize Results", "type": "main", "index": 0 }]] },
+    "HTTP: OpenAlex": { "main": [[{ "node": "Fn: Normalize Results", "type": "main", "index": 1 }]] },
+    "HTTP: arXiv": { "main": [[{ "node": "Fn: Normalize Results", "type": "main", "index": 2 }]] },
+    "Fn: Normalize Results": { "main": [[{ "node": "Fn: Filter + Dedup + Score", "type": "main", "index": 0 }]] },
+    "Fn: Filter + Dedup + Score": { "main": [[{ "node": "Fn: Build HTML", "type": "main", "index": 0 }]] },
+    "Fn: Build HTML": { "main": [[{ "node": "HTML → PDF (HTTP)", "type": "main", "index": 0 }]] },
+    "HTML → PDF (HTTP)": { "main": [[{ "node": "Webhook Response", "type": "main", "index": 0 }]] }
+  }
+}
